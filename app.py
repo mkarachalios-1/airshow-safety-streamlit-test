@@ -4,7 +4,7 @@ import numpy as np
 import json
 from pathlib import Path
 
-# --- resilient plotly import (auto-installs if missing) ---
+# --- resilient plotly import (auto-install if missing) ---
 try:
     import plotly.graph_objects as go
 except Exception:
@@ -18,42 +18,76 @@ DATA_JSON = Path("data/airshow_accidents.json")
 RATES_JSON = Path("data/historical_rates.json")
 DATA_JSON.parent.mkdir(parents=True, exist_ok=True)
 
+# ---------- helpers ----------
+def parse_date_column(s: pd.Series, year_col: pd.Series | None = None) -> pd.Series:
+    """Parse 'date' robustly.
+    - Only treat numbers as epoch if big enough (>=1e9 sec or >=1e11 ms).
+    - Otherwise leave as NaT (prevents 1970 artefacts).
+    - If the parsed year is 1970 but a different 'year' is available, set NaT.
+    """
+    if s is None or len(s) == 0:
+        return pd.to_datetime(pd.Series([], dtype="datetime64[ns]"))
+
+    if pd.api.types.is_numeric_dtype(s):
+        s_nonan = s.dropna()
+        if len(s_nonan) and s_nonan.max() >= 1e11:
+            dt = pd.to_datetime(s, unit="ms", errors="coerce")
+        elif len(s_nonan) and s_nonan.max() >= 1e9:
+            dt = pd.to_datetime(s, unit="s", errors="coerce")
+        else:
+            # tiny numbers are NOT timestamps -> treat as invalid
+            dt = pd.to_datetime(pd.Series([np.nan]*len(s), index=s.index), errors="coerce")
+    else:
+        dt = pd.to_datetime(s, errors="coerce")
+
+    if year_col is not None:
+        y = pd.to_numeric(year_col, errors="coerce")
+        bad_1970 = (dt.dt.year == 1970)
+        dt.loc[bad_1970 & y.notna() & (y != 1970)] = pd.NaT
+    return dt
+
+def sort_key_from_date(df: pd.DataFrame) -> pd.Series:
+    """Sort key: prefer real date; fallback to Jan-01 of 'year'."""
+    d = df.get("date")
+    y = pd.to_numeric(df.get("year"), errors="coerce")
+    key = pd.to_datetime(d, errors="coerce")
+    fallback = pd.to_datetime(y, format="%Y", errors="coerce")
+    key = key.fillna(fallback)
+    return key
+
+# ---------- data ----------
 @st.cache_data
 def load_data():
-    # Read accidents JSON (supports ISO strings OR epoch-ms numbers)
     if DATA_JSON.exists():
         df = pd.read_json(DATA_JSON)
     else:
         df = pd.DataFrame()
 
-    if not df.empty:
+    if df.empty:
+        df = pd.DataFrame(columns=[
+            "date","year","aircraft_type","category","country","manoeuvre",
+            "event_name","location","remarks","contributing_factor",
+            "fatalities","casualties","fit","mac","loc","mechanical","enviro",
+            "man_factor","machine_factor","medium_factor","mission_factor","management_factor"
+        ])
+    else:
+        # parse dates robustly and repair types
         if "date" in df.columns:
-            if pd.api.types.is_numeric_dtype(df["date"]):
-                # epoch numbers -> interpret as milliseconds since 1970
-                df["date"] = pd.to_datetime(df["date"], unit="ms", errors="coerce")
-            else:
-                # ISO/other strings
-                df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df["date"] = parse_date_column(df["date"], df.get("year"))
         else:
             df["date"] = pd.NaT
 
         if "year" not in df.columns:
-            df["year"] = df["date"].dt.year
+            df["year"] = pd.to_datetime(df["date"], errors="coerce").dt.year
 
         df["fatalities"] = pd.to_numeric(df.get("fatalities", 0), errors="coerce").fillna(0).astype(int)
-        df["casualties"]  = pd.to_numeric(df.get("casualties", 0), errors="coerce").fillna(0).astype(int)
+        df["casualties"] = pd.to_numeric(df.get("casualties", 0), errors="coerce").fillna(0).astype(int)
 
-        for c in ["man_factor","machine_factor","medium_factor","mission_factor","management_factor"]:
+        for c in ["fit","mac","loc","mechanical","enviro",
+                  "man_factor","machine_factor","medium_factor","mission_factor","management_factor"]:
             if c not in df.columns:
                 df[c] = 0
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
-    else:
-        df = pd.DataFrame(columns=[
-            "date","year","aircraft_type","category","country","manoeuvre","event_name","location",
-            "remarks","contributing_factor","fatalities","casualties",
-            "fit","mac","loc","mechanical","enviro",
-            "man_factor","machine_factor","medium_factor","mission_factor","management_factor"
-        ])
 
     hist = {"years": [], "BAAR": [], "AFR": [], "ACR": [], "AER": []}
     if RATES_JSON.exists():
@@ -65,12 +99,15 @@ def load_data():
 
 df, hist = load_data()
 
-# ------------------- UI HEADERS -------------------
+# (safety) if we already have an updated df in session, prefer it
+if "df_override" in st.session_state:
+    df = st.session_state["df_override"]
+
+# ---------- UI ----------
 st.title("Airshow Safety & Excellence Database")
 st.markdown("#### 5M-aligned repository of airshow accidents (1908–2025). Use search and filters below. Charts update as you filter.")
 st.markdown("### Barker Airshow Incident & Accident Database")
 
-# ------------------- FILTERS -------------------
 q = st.text_input("Search", placeholder="e.g. engine, loop, MAC, Duxford")
 
 if df["year"].dropna().empty:
@@ -91,27 +128,24 @@ m_med  = c5.checkbox("Medium", True)
 m_mis  = c6.checkbox("Mission", True)
 m_mgmt = c7.checkbox("Management", True)
 
-# ------------------- APPLY FILTERS -------------------
+# ---------- filters ----------
 f = df[(df["year"] >= year_from) & (df["year"] <= year_to)].copy() if not df.empty else df.copy()
 
-# Event type by casualties
 if not f.empty:
     if acc_on and not inc_on:
         f = f[f["casualties"] > 0]
     elif inc_on and not acc_on:
         f = f[f["casualties"] == 0]
 
-# 5M mask (any selected)
 if not f.empty and any([m_man, m_mach, m_med, m_mis, m_mgmt]):
-    mask = pd.Series(False, index=f.index)
-    if m_man:  mask |= (f["man_factor"] == 1)
-    if m_mach: mask |= (f["machine_factor"] == 1)
-    if m_med:  mask |= (f["medium_factor"] == 1)
-    if m_mis:  mask |= (f["mission_factor"] == 1)
-    if m_mgmt: mask |= (f["management_factor"] == 1)
-    f = f[mask]
+    m = pd.Series(False, index=f.index)
+    if m_man:  m |= (f["man_factor"] == 1)
+    if m_mach: m |= (f["machine_factor"] == 1)
+    if m_med:  m |= (f["medium_factor"] == 1)
+    if m_mis:  m |= (f["mission_factor"] == 1)
+    if m_mgmt: m |= (f["management_factor"] == 1)
+    f = f[m]
 
-# Text search
 if not f.empty and q:
     hay = (
         f.get("aircraft_type","").astype(str) + " " +
@@ -126,47 +160,39 @@ if not f.empty and q:
     ).str.lower()
     f = f[hay.str.contains(q.lower(), na=False)]
 
-# ------------------- KPIs -------------------
+# ---------- KPIs ----------
 k1, k2, k3 = st.columns(3)
 k1.metric("Accidents/Incidents", int(f.shape[0]) if not f.empty else 0)
 k2.metric("Fatalities", int(f["fatalities"].sum()) if not f.empty else 0)
 k3.metric("Casualties", int(f["casualties"].sum()) if not f.empty else 0)
 
-# ------------------- CHARTS -------------------
-# Accidents per year (filtered)
+# ---------- Charts (with spacing to prevent overlap) ----------
 if not f.empty and "year" in f.columns:
     by_year = f.dropna(subset=["year"]).groupby("year").size().reset_index(name="count")
     fig1 = go.Figure()
-    fig1.add_trace(go.Scatter(x=by_year["year"], y=by_year["count"], mode="lines+markers", name="Accidents (filtered)"))
-    fig1.update_layout(height=360, margin=dict(l=10, r=10, t=10, b=10))
+    fig1.add_trace(go.Scatter(x=by_year["year"], y=by_year["count"],
+                              mode="lines+markers", name="Accidents (filtered)"))
+    fig1.update_layout(height=380, margin=dict(l=10, r=10, t=20, b=10))
     st.plotly_chart(fig1, use_container_width=True)
-else:
-    st.info("No data for the selected filters.")
+st.divider()
 
-# BAAR/AFR/ACR with AER on right axis 99.800–100% (AER colored green)
 if hist.get("years"):
     fig2 = go.Figure()
     fig2.add_trace(go.Scatter(x=hist["years"], y=hist["BAAR"], mode="lines+markers", name="BAAR (per 10k)"))
     fig2.add_trace(go.Scatter(x=hist["years"], y=hist["AFR"],  mode="lines+markers", name="AFR (per 10k)"))
     fig2.add_trace(go.Scatter(x=hist["years"], y=hist["ACR"],  mode="lines+markers", name="ACR (per 10k)"))
+    # AER in green on right axis 99.800–100.000
     fig2.add_trace(go.Scatter(x=hist["years"], y=hist["AER"],  mode="lines+markers",
                               name="AER (%)", yaxis="y2", line=dict(color="#2ecc71")))
     fig2.update_layout(
         yaxis=dict(title="per 10k events"),
-        yaxis2=dict(
-            title="AER (%)",
-            overlaying="y",
-            side="right",
-            range=[99.8, 100.0],
-            tickformat=".3f",
-            tick0=99.8,
-            dtick=0.05
-        ),
-        height=360, margin=dict(l=10, r=10, t=10, b=10)
+        yaxis2=dict(title="AER (%)", overlaying="y", side="right",
+                    range=[99.8, 100.0], tickformat=".3f", tick0=99.8, dtick=0.05),
+        height=380, margin=dict(l=10, r=10, t=20, b=10)
     )
     st.plotly_chart(fig2, use_container_width=True)
+st.divider()
 
-# 5M pie
 if not f.empty:
     five = {
         "Man": int((f["man_factor"]==1).sum()),
@@ -177,10 +203,10 @@ if not f.empty:
     }
     fig3 = go.Figure(data=[go.Pie(labels=list(five.keys()), values=list(five.values()))])
     fig3.update_traces(textinfo="percent+label", hovertemplate="%{label}: %{value}")
-    fig3.update_layout(height=360, margin=dict(l=10, r=10, t=10, b=10), showlegend=True)
+    fig3.update_layout(height=380, margin=dict(l=10, r=10, t=20, b=10), showlegend=True)
     st.plotly_chart(fig3, use_container_width=True)
+st.divider()
 
-# Manoeuvre pie
 if not f.empty:
     keys = [
         ("cuban 8","Cuban 8"), ("cuban eight","Cuban 8"),
@@ -192,40 +218,42 @@ if not f.empty:
         ("tail slide","Tailslide"), ("tailslide","Tailslide"),
         ("snap roll","Snap roll"), ("lomcevak","Lomcevak")
     ]
-    text = (
+    txt = (
         f.get("manoeuvre","").astype(str) + " " +
         f.get("remarks","").astype(str) + " " +
         f.get("contributing_factor","").astype(str)
     ).str.lower()
-    counts = {}
-    for pat, label in keys:
-        counts[label] = counts.get(label, 0) + text.str.contains(pat).sum()
-    items = sorted([(k,v) for k,v in counts.items() if v>0], key=lambda x: x[1], reverse=True)
+    mcounts = {label: int(txt.str.contains(pat).sum()) for pat, label in keys}
+    items = [(k,v) for k,v in mcounts.items() if v>0]
+    items.sort(key=lambda x: x[1], reverse=True)
     other = sum(v for _,v in items[10:])
     items = items[:10]
-    if other>0: items.append(("Other", other))
+    if other>0:
+        items.append(("Other", other))
     if items:
         fig4 = go.Figure(data=[go.Pie(labels=[i[0] for i in items], values=[i[1] for i in items])])
         fig4.update_traces(textinfo="percent+label", hovertemplate="%{label}: %{value}")
-        fig4.update_layout(height=360, margin=dict(l=10, r=10, t=10, b=10), showlegend=True)
+        fig4.update_layout(height=380, margin=dict(l=10, r=10, t=20, b=10), showlegend=True)
         st.plotly_chart(fig4, use_container_width=True)
+st.divider()
 
-# ------------------- TABLE -------------------
-show_cols = [c for c in [
-    "date","aircraft_type","category","country","manoeuvre","fit","mac","loc","mechanical","enviro",
-    "fatalities","casualties","event_name","location","contributing_factor",
-    "man_factor","machine_factor","medium_factor","mission_factor","management_factor","remarks"
-] if c in f.columns]
+# ---------- Table (newest first; show clean date) ----------
 if not f.empty:
-    f_out = f[show_cols].sort_values("date", ascending=False).reset_index(drop=True)
-    # display dates as YYYY-MM-DD (no 1970 times)
-    disp = f_out.copy()
-    disp["date"] = pd.to_datetime(disp["date"], errors="coerce").dt.date.astype(str)
+    # build sort key using real date or fallback to year
+    f = f.assign(_sort_key=sort_key_from_date(f))
+    f = f.sort_values("_sort_key", ascending=False).drop(columns=["_sort_key"])
+    show_cols = [c for c in [
+        "date","aircraft_type","category","country","manoeuvre","fit","mac","loc","mechanical","enviro",
+        "fatalities","casualties","event_name","location","contributing_factor",
+        "man_factor","machine_factor","medium_factor","mission_factor","management_factor","remarks"
+    ] if c in f.columns]
+    disp = f[show_cols].copy()
+    disp["date"] = pd.to_datetime(disp["date"], errors="coerce").dt.strftime("%Y-%m-%d")
 else:
-    disp = pd.DataFrame(columns=show_cols)
+    disp = pd.DataFrame()
 st.dataframe(disp, use_container_width=True, hide_index=True)
 
-# ------------------- ADMIN: ADD RECORD -------------------
+# ---------- Admin: add record ----------
 with st.expander("Admin: add incident/accident", expanded=False):
     ok = True
     if "ADMIN_PASSWORD" in st.secrets:
@@ -284,6 +312,7 @@ with st.expander("Admin: add incident/accident", expanded=False):
                 "crew_kill": int(crew_kill), "crew_inj": int(crew_inj),
                 "pax_kill": int(pax_kill), "pax_inj": int(pax_inj),
             }
+            # derive 5M
             man  = 1 if (new["loc"]==1 or new["fit"]==1) else 0
             mach = 1 if (new["mechanical"]==1 or new["structural"]==1) else 0
             med  = 1 if (new["enviro"]==1 or new["weather"]==1 or new["bird_strike"]==1) else 0
@@ -299,20 +328,24 @@ with st.expander("Admin: add incident/accident", expanded=False):
             new["fatalities"] = new["pilot_killed"] + new["crew_kill"] + new["pax_kill"]
             new["casualties"] = new["fatalities"] + new["pilot_injured"] + new["crew_inj"] + new["pax_inj"]
 
-            # Append and save as ISO dates (prevents epoch/1970 issues)
+            # read current, append, save with ISO dates
             try:
                 cur = pd.read_json(DATA_JSON) if DATA_JSON.exists() else pd.DataFrame()
             except Exception:
                 cur = pd.DataFrame()
             cur = pd.concat([cur, pd.DataFrame([new])], ignore_index=True)
 
-            # Ensure datetime dtype before saving, then write ISO
-            if pd.api.types.is_numeric_dtype(cur.get("date", pd.Series([], dtype="float64"))):
-                cur["date"] = pd.to_datetime(cur["date"], unit="ms", errors="coerce")
-            else:
-                cur["date"] = pd.to_datetime(cur["date"], errors="coerce")
+            # ensure proper datetime then write ISO
+            if "date" in cur.columns:
+                # if someone ever wrote numbers, fix them properly before saving
+                parsed = parse_date_column(cur["date"], cur.get("year"))
+                cur["date"] = parsed.dt.strftime("%Y-%m-%d")
+            DATA_JSON.write_text(cur.to_json(orient="records"), encoding="utf-8")
 
-            cur.to_json(DATA_JSON, orient="records", date_format="iso")
+            # make the new df immediately visible and sorted
+            cur_disp = cur.copy()
+            cur_disp["date"] = pd.to_datetime(cur_disp["date"], errors="coerce")
+            st.session_state["df_override"] = cur_disp
 
             st.cache_data.clear()
             st.rerun()
