@@ -233,10 +233,6 @@ with st.expander("Admin: add incident/accident", expanded=False):
             df2 = pd.read_json("data/airshow_accidents.json")
             df2 = pd.concat([df2, pd.DataFrame([new])], ignore_index=True)
             df2.to_json("data/airshow_accidents.json", orient="records")
-            st.experimental_rerun()
-            - df2.to_json("data/airshow_accidents.json", orient="records")
-            - st.experimental_rerun()
-            + df2.to_json("data/airshow_accidents.json", orient="records")
-            + st.cache_data.clear()
-            + st.rerun()
+            st.cache_data.clear()
+            st.rerun()
 
