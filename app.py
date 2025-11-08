@@ -4,7 +4,7 @@ import numpy as np
 import json
 from pathlib import Path
 
-# --- resilient plotly import (auto-install if missing) ---
+# ---------- resilient plotly import ----------
 try:
     import plotly.graph_objects as go
 except Exception:
@@ -14,20 +14,17 @@ except Exception:
 
 st.set_page_config(page_title="Airshow Safety & Excellence Database", layout="wide")
 
-DATA_JSON = Path("data/airshow_accidents.json")
-RATES_JSON = Path("data/historical_rates.json")
-DATA_JSON.parent.mkdir(parents=True, exist_ok=True)
+# ---------- paths (write to /tmp so it works on Streamlit Cloud) ----------
+PKG_DATA = Path(__file__).parent / "data" / "airshow_accidents.json"      # packaged copy (read-only)
+WORK_DATA = Path("/tmp/airshow_accidents.json")                           # live working copy (writable)
+RATES_JSON = Path(__file__).parent / "data" / "historical_rates.json"     # packaged rates (read-only)
+WORK_DATA.parent.mkdir(parents=True, exist_ok=True)
 
 # ---------- helpers ----------
 def parse_date_column(s: pd.Series, year_col: pd.Series | None = None) -> pd.Series:
-    """Parse 'date' robustly.
-    - Only treat numbers as epoch if big enough (>=1e9 sec or >=1e11 ms).
-    - Otherwise leave as NaT (prevents 1970 artefacts).
-    - If the parsed year is 1970 but a different 'year' is available, set NaT.
-    """
+    """Robust date parsing. Only treat large numbers as epoch. Ignore tiny numbers (prevents 1970)."""
     if s is None or len(s) == 0:
         return pd.to_datetime(pd.Series([], dtype="datetime64[ns]"))
-
     if pd.api.types.is_numeric_dtype(s):
         s_nonan = s.dropna()
         if len(s_nonan) and s_nonan.max() >= 1e11:
@@ -35,11 +32,9 @@ def parse_date_column(s: pd.Series, year_col: pd.Series | None = None) -> pd.Ser
         elif len(s_nonan) and s_nonan.max() >= 1e9:
             dt = pd.to_datetime(s, unit="s", errors="coerce")
         else:
-            # tiny numbers are NOT timestamps -> treat as invalid
             dt = pd.to_datetime(pd.Series([np.nan]*len(s), index=s.index), errors="coerce")
     else:
         dt = pd.to_datetime(s, errors="coerce")
-
     if year_col is not None:
         y = pd.to_numeric(year_col, errors="coerce")
         bad_1970 = (dt.dt.year == 1970)
@@ -48,20 +43,26 @@ def parse_date_column(s: pd.Series, year_col: pd.Series | None = None) -> pd.Ser
 
 def sort_key_from_date(df: pd.DataFrame) -> pd.Series:
     """Sort key: prefer real date; fallback to Jan-01 of 'year'."""
-    d = df.get("date")
+    d = pd.to_datetime(df.get("date"), errors="coerce")
     y = pd.to_numeric(df.get("year"), errors="coerce")
-    key = pd.to_datetime(d, errors="coerce")
     fallback = pd.to_datetime(y, format="%Y", errors="coerce")
-    key = key.fillna(fallback)
-    return key
+    return d.fillna(fallback)
 
 # ---------- data ----------
 @st.cache_data
 def load_data():
-    if DATA_JSON.exists():
-        df = pd.read_json(DATA_JSON)
+    # ensure we have a writable working copy in /tmp
+    if WORK_DATA.exists():
+        src = WORK_DATA
+    elif PKG_DATA.exists():
+        src = PKG_DATA
     else:
+        src = None
+
+    if src is None:
         df = pd.DataFrame()
+    else:
+        df = pd.read_json(src)
 
     if df.empty:
         df = pd.DataFrame(columns=[
@@ -71,17 +72,13 @@ def load_data():
             "man_factor","machine_factor","medium_factor","mission_factor","management_factor"
         ])
     else:
-        # parse dates robustly and repair types
-        if "date" in df.columns:
-            df["date"] = parse_date_column(df["date"], df.get("year"))
-        else:
-            df["date"] = pd.NaT
-
+        # parse/repair
+        df["date"] = parse_date_column(df.get("date"), df.get("year"))
         if "year" not in df.columns:
-            df["year"] = pd.to_datetime(df["date"], errors="coerce").dt.year
+            df["year"] = df["date"].dt.year
 
         df["fatalities"] = pd.to_numeric(df.get("fatalities", 0), errors="coerce").fillna(0).astype(int)
-        df["casualties"] = pd.to_numeric(df.get("casualties", 0), errors="coerce").fillna(0).astype(int)
+        df["casualties"]  = pd.to_numeric(df.get("casualties", 0), errors="coerce").fillna(0).astype(int)
 
         for c in ["fit","mac","loc","mechanical","enviro",
                   "man_factor","machine_factor","medium_factor","mission_factor","management_factor"]:
@@ -89,6 +86,13 @@ def load_data():
                 df[c] = 0
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
 
+    # write an initial working copy if it doesn't exist
+    if not WORK_DATA.exists() and not df.empty:
+        tmp = df.copy()
+        tmp["date"] = pd.to_datetime(tmp["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        WORK_DATA.write_text(tmp.to_json(orient="records"), encoding="utf-8")
+
+    # load rates
     hist = {"years": [], "BAAR": [], "AFR": [], "ACR": [], "AER": []}
     if RATES_JSON.exists():
         try:
@@ -99,7 +103,7 @@ def load_data():
 
 df, hist = load_data()
 
-# (safety) if we already have an updated df in session, prefer it
+# prefer runtime-updated df if we have it
 if "df_override" in st.session_state:
     df = st.session_state["df_override"]
 
@@ -128,7 +132,7 @@ m_med  = c5.checkbox("Medium", True)
 m_mis  = c6.checkbox("Mission", True)
 m_mgmt = c7.checkbox("Management", True)
 
-# ---------- filters ----------
+# ---------- filtering ----------
 f = df[(df["year"] >= year_from) & (df["year"] <= year_to)].copy() if not df.empty else df.copy()
 
 if not f.empty:
@@ -166,7 +170,7 @@ k1.metric("Accidents/Incidents", int(f.shape[0]) if not f.empty else 0)
 k2.metric("Fatalities", int(f["fatalities"].sum()) if not f.empty else 0)
 k3.metric("Casualties", int(f["casualties"].sum()) if not f.empty else 0)
 
-# ---------- Charts (with spacing to prevent overlap) ----------
+# ---------- Charts (with spacing) ----------
 if not f.empty and "year" in f.columns:
     by_year = f.dropna(subset=["year"]).groupby("year").size().reset_index(name="count")
     fig1 = go.Figure()
@@ -237,9 +241,8 @@ if not f.empty:
         st.plotly_chart(fig4, use_container_width=True)
 st.divider()
 
-# ---------- Table (newest first; show clean date) ----------
+# ---------- Table (newest first) ----------
 if not f.empty:
-    # build sort key using real date or fallback to year
     f = f.assign(_sort_key=sort_key_from_date(f))
     f = f.sort_values("_sort_key", ascending=False).drop(columns=["_sort_key"])
     show_cols = [c for c in [
@@ -328,21 +331,19 @@ with st.expander("Admin: add incident/accident", expanded=False):
             new["fatalities"] = new["pilot_killed"] + new["crew_kill"] + new["pax_kill"]
             new["casualties"] = new["fatalities"] + new["pilot_injured"] + new["crew_inj"] + new["pax_inj"]
 
-            # read current, append, save with ISO dates
+            # read working copy, append, save (ISO dates) in /tmp
             try:
-                cur = pd.read_json(DATA_JSON) if DATA_JSON.exists() else pd.DataFrame()
+                cur = pd.read_json(WORK_DATA) if WORK_DATA.exists() else pd.DataFrame()
             except Exception:
                 cur = pd.DataFrame()
             cur = pd.concat([cur, pd.DataFrame([new])], ignore_index=True)
 
             # ensure proper datetime then write ISO
-            if "date" in cur.columns:
-                # if someone ever wrote numbers, fix them properly before saving
-                parsed = parse_date_column(cur["date"], cur.get("year"))
-                cur["date"] = parsed.dt.strftime("%Y-%m-%d")
-            DATA_JSON.write_text(cur.to_json(orient="records"), encoding="utf-8")
+            parsed = parse_date_column(cur.get("date"), cur.get("year"))
+            cur["date"] = parsed.dt.strftime("%Y-%m-%d")
+            WORK_DATA.write_text(cur.to_json(orient="records"), encoding="utf-8")
 
-            # make the new df immediately visible and sorted
+            # make the new df visible immediately
             cur_disp = cur.copy()
             cur_disp["date"] = pd.to_datetime(cur_disp["date"], errors="coerce")
             st.session_state["df_override"] = cur_disp
