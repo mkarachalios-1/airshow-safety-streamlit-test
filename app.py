@@ -21,6 +21,47 @@ WORK_DATA = Path("/tmp/airshow_accidents.json")                        # live wo
 WORK_DATA.parent.mkdir(parents=True, exist_ok=True)
 
 # --------- helpers ----------
+_CONTINENT_MAP = {
+    # North America
+    "united states": "North America", "usa": "North America", "u.s.a.": "North America", "us": "North America",
+    "canada": "North America", "mexico": "North America",
+    # South America
+    "brazil": "South America", "argentina": "South America", "chile": "South America", "peru": "South America",
+    "colombia": "South America", "uruguay": "South America", "paraguay": "South America", "bolivia": "South America",
+    # Europe
+    "united kingdom": "Europe", "uk": "Europe", "england": "Europe", "scotland": "Europe", "wales": "Europe",
+    "northern ireland": "Europe", "great britain": "Europe", "britain": "Europe",
+    "ireland": "Europe", "france": "Europe", "germany": "Europe", "italy": "Europe", "spain": "Europe",
+    "portugal": "Europe", "netherlands": "Europe", "belgium": "Europe", "switzerland": "Europe", "austria": "Europe",
+    "sweden": "Europe", "norway": "Europe", "finland": "Europe", "denmark": "Europe", "iceland": "Europe",
+    "czech republic": "Europe", "czechia": "Europe", "poland": "Europe", "hungary": "Europe", "romania": "Europe",
+    "bulgaria": "Europe", "greece": "Europe", "serbia": "Europe", "croatia": "Europe", "slovenia": "Europe",
+    "slovakia": "Europe", "bosnia": "Europe", "north macedonia": "Europe", "albania": "Europe",
+    "estonia": "Europe", "latvia": "Europe", "lithuania": "Europe", "ukraine": "Europe",
+    "russia": "Europe", "turkey": "Europe", "türkiye": "Europe", "turkiye": "Europe",
+    # Asia
+    "china": "Asia", "japan": "Asia", "south korea": "Asia", "korea, south": "Asia", "north korea": "Asia",
+    "india": "Asia", "pakistan": "Asia", "bangladesh": "Asia", "sri lanka": "Asia", "nepal": "Asia",
+    "myanmar": "Asia", "thailand": "Asia", "vietnam": "Asia", "malaysia": "Asia", "singapore": "Asia",
+    "indonesia": "Asia", "philippines": "Asia", "taiwan": "Asia", "hong kong": "Asia", "mongolia": "Asia",
+    "laos": "Asia", "cambodia": "Asia", "israel": "Asia", "jordan": "Asia", "lebanon": "Asia",
+    "saudi arabia": "Asia", "united arab emirates": "Asia", "uae": "Asia", "qatar": "Asia", "bahrain": "Asia",
+    "oman": "Asia", "kuwait": "Asia", "iran": "Asia", "iraq": "Asia", "yemen": "Asia",
+    # Africa
+    "south africa": "Africa", "egypt": "Africa", "morocco": "Africa", "kenya": "Africa", "ethiopia": "Africa",
+    "nigeria": "Africa", "ghana": "Africa", "tunisia": "Africa", "algeria": "Africa", "tanzania": "Africa",
+    "uganda": "Africa", "zambia": "Africa", "zimbabwe": "Africa", "namibia": "Africa", "botswana": "Africa",
+    "senegal": "Africa", "cote d'ivoire": "Africa", "ivory coast": "Africa",
+    # Oceania
+    "australia": "Oceania", "new zealand": "Oceania",
+}
+
+def country_to_continent(country: str) -> str:
+    if not isinstance(country, str) or not country.strip():
+        return "Unknown"
+    key = country.strip().lower()
+    return _CONTINENT_MAP.get(key, "Unknown")
+
 def parse_date_column(s, year_col=None):
     """Robust date parsing; only large numbers are treated as epoch."""
     if s is None or len(s) == 0:
@@ -46,6 +87,12 @@ def sort_key_from_date(df):
     y = pd.to_numeric(df.get("year"), errors="coerce")
     fallback = pd.to_datetime(y, format="%Y", errors="coerce")
     return d.fillna(fallback)
+
+def series_sum(df: pd.DataFrame, cols: list[str]) -> pd.Series:
+    s = pd.Series(0, index=df.index, dtype="float64")
+    for c in cols:
+        s = s + pd.to_numeric(df.get(c, 0), errors="coerce").fillna(0)
+    return s
 
 # ---- GitHub commit helper ----
 def commit_work_data_to_github():
@@ -109,6 +156,7 @@ def load_data():
             "date","year","aircraft_type","category","country","manoeuvre",
             "event_name","location","remarks","contributing_factor",
             "fatalities","casualties","fit","mac","loc","mechanical","enviro",
+            "pilot_killed","pilot_injured","crew_kill","crew_inj","pax_kill","pax_inj",
             "man_factor","machine_factor","medium_factor","mission_factor","management_factor"
         ])
     else:
@@ -116,14 +164,16 @@ def load_data():
         if "year" not in df.columns:
             df["year"] = df["date"].dt.year
 
-        df["fatalities"] = pd.to_numeric(df.get("fatalities", 0), errors="coerce").fillna(0).astype(int)
-        df["casualties"]  = pd.to_numeric(df.get("casualties", 0), errors="coerce").fillna(0).astype(int)
-
-        for c in ["fit","mac","loc","mechanical","enviro",
+        # ensure numeric
+        for c in ["fatalities","casualties","pilot_killed","pilot_injured","crew_kill","crew_inj","pax_kill","pax_inj",
+                  "fit","mac","loc","mechanical","enviro",
                   "man_factor","machine_factor","medium_factor","mission_factor","management_factor"]:
             if c not in df.columns:
                 df[c] = 0
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+
+    # add continent
+    df["continent"] = df.get("country", "").astype(str).apply(country_to_continent)
 
     # ensure we have a working copy in /tmp
     if not WORK_DATA.exists() and not df.empty:
@@ -144,20 +194,50 @@ if "df_override" in st.session_state:
     df = st.session_state["df_override"]
 
 # --------- UI ---------
-st.title("Airshow Safety & Excellence")
+st.title("Airshow Safety & Excellence Database")
+st.markdown("#### 5M-aligned repository of airshow accidents (1908–2025). Use search and filters below. Charts update as you filter.")
 st.markdown("### Barker Airshow Incident & Accident Database")
 
+# ---- TEXT SEARCH
 q = st.text_input("Search", placeholder="e.g. engine, loop, MAC, Duxford")
 
+# ---- YEAR
 if df["year"].dropna().empty:
     ymin, ymax = 1908, 2025
 else:
     ymin, ymax = int(df["year"].min()), int(df["year"].max())
-
 c_year1, c_year2 = st.columns(2)
 year_from = c_year1.number_input("Year from", value=ymin, min_value=ymin, max_value=ymax, step=1)
 year_to   = c_year2.number_input("to",        value=ymax, min_value=ymin, max_value=ymax, step=1)
 
+# ---- NEW DROPDOWN FILTERS (multi-selects)
+col_a, col_b, col_c = st.columns(3)
+aircraft_options = sorted([x for x in df.get("aircraft_type","").dropna().unique() if str(x).strip()])
+country_options  = sorted([x for x in df.get("country","").dropna().unique() if str(x).strip()])
+continent_options= sorted([x for x in df.get("continent","").dropna().unique() if str(x).strip()])
+
+sel_aircraft = col_a.multiselect("Aircraft type", aircraft_options, default=[])
+sel_country  = col_b.multiselect("Country", country_options, default=[])
+sel_continent= col_c.multiselect("Continent", continent_options, default=[])
+
+col_d, col_e = st.columns(2)
+manoeuvre_options = sorted([x for x in df.get("manoeuvre","").dropna().unique() if str(x).strip()])
+sel_manoeuvre = col_d.multiselect("Manoeuvre", manoeuvre_options, default=[])
+
+severity = col_e.selectbox(
+    "Severity",
+    [
+        "Any",
+        "Fatal (any)",
+        "Non-fatal only",
+        "Fatal: Pilot/Crew",
+        "Fatal: Passengers",
+        "Fatal: Spectators/Crowd"
+    ],
+    index=0
+)
+
+# Existing event-type & 5M toggles
 c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
 acc_on = c1.checkbox("Accidents", True)
 inc_on = c2.checkbox("Incidents", True)
@@ -170,12 +250,45 @@ m_mgmt = c7.checkbox("Management", True)
 # --------- filtering ---------
 f = df[(df["year"] >= year_from) & (df["year"] <= year_to)].copy() if not df.empty else df.copy()
 
+# Dropdown filters
+if len(sel_aircraft):
+    f = f[f["aircraft_type"].isin(sel_aircraft)]
+if len(sel_country):
+    f = f[f["country"].isin(sel_country)]
+if len(sel_continent):
+    f = f[f["continent"].isin(sel_continent)]
+if len(sel_manoeuvre):
+    f = f[f["manoeuvre"].isin(sel_manoeuvre)]
+
+# Severity filters
+if not f.empty:
+    any_fatal   = (series_sum(f, ["fatalities","pilot_killed","crew_kill","pax_kill",
+                                  "ground_kill","spectator_kill","spectator_killed","crowd_kill",
+                                  "ground_fatalities","spectator_fatalities"]) > 0)
+    pc_fatal    = (series_sum(f, ["pilot_killed","crew_kill"]) > 0)
+    pax_fatal   = (series_sum(f, ["pax_kill"]) > 0)
+    crowd_fatal = (series_sum(f, ["ground_kill","spectator_kill","spectator_killed","crowd_kill",
+                                  "ground_fatalities","spectator_fatalities"]) > 0)
+
+    if severity == "Fatal (any)":
+        f = f[any_fatal]
+    elif severity == "Non-fatal only":
+        f = f[~any_fatal]
+    elif severity == "Fatal: Pilot/Crew":
+        f = f[pc_fatal]
+    elif severity == "Fatal: Passengers":
+        f = f[pax_fatal]
+    elif severity == "Fatal: Spectators/Crowd":
+        f = f[crowd_fatal]
+
+# Event type by casualties
 if not f.empty:
     if acc_on and not inc_on:
         f = f[f["casualties"] > 0]
     elif inc_on and not acc_on:
         f = f[f["casualties"] == 0]
 
+# 5M mask (any selected)
 if not f.empty and any([m_man, m_mach, m_med, m_mis, m_mgmt]):
     m = pd.Series(False, index=f.index)
     if m_man:  m |= (f["man_factor"] == 1)
@@ -185,6 +298,7 @@ if not f.empty and any([m_man, m_mach, m_med, m_mis, m_mgmt]):
     if m_mgmt: m |= (f["management_factor"] == 1)
     f = f[m]
 
+# Text search
 if not f.empty and q:
     hay = (
         f.get("aircraft_type","").astype(str) + " " +
@@ -244,17 +358,11 @@ if not f.empty:
     fig3 = go.Figure(data=[go.Pie(labels=list(five.keys()), values=list(five.values()))])
     fig3.update_traces(textinfo="percent+label", textposition="outside", automargin=True)
     fig3.update_layout(
-    height=440,
-    margin=dict(l=60, r=220, t=40, b=60),
-    showlegend=True,
-    legend=dict(
-        orientation="v",
-        x=1.02,          # place legend to the right of the plot area
-        y=0.5,
-        xanchor="left",
-        yanchor="middle"
+        height=440,
+        margin=dict(l=60, r=220, t=40, b=60),
+        showlegend=True,
+        legend=dict(orientation="v", x=1.02, y=0.5, xanchor="left", yanchor="middle")
     )
-)
     st.plotly_chart(fig3, use_container_width=True)
 st.divider()
 
@@ -285,17 +393,11 @@ if not f.empty:
         fig4 = go.Figure(data=[go.Pie(labels=[i[0] for i in items], values=[i[1] for i in items])])
         fig4.update_traces(textinfo="percent+label", textposition="outside", automargin=True)
         fig4.update_layout(
-    height=440,
-    margin=dict(l=60, r=220, t=40, b=60),
-    showlegend=True,
-    legend=dict(
-        orientation="v",
-        x=1.02,          # place legend to the right of the plot area
-        y=0.5,
-        xanchor="left",
-        yanchor="middle"
-    )
-)
+            height=440,
+            margin=dict(l=60, r=220, t=40, b=60),
+            showlegend=True,
+            legend=dict(orientation="v", x=1.02, y=0.5, xanchor="left", yanchor="middle")
+        )
         st.plotly_chart(fig4, use_container_width=True)
 st.divider()
 
@@ -304,8 +406,9 @@ if not f.empty:
     f = f.assign(_sort_key=sort_key_from_date(f))
     f = f.sort_values("_sort_key", ascending=False).drop(columns=["_sort_key"])
     show_cols = [c for c in [
-        "date","aircraft_type","category","country","manoeuvre","fit","mac","loc","mechanical","enviro",
-        "fatalities","casualties","event_name","location","contributing_factor",
+        "date","aircraft_type","category","country","continent","manoeuvre","fit","mac","loc","mechanical","enviro",
+        "fatalities","casualties","pilot_killed","crew_kill","pax_kill",
+        "event_name","location","contributing_factor",
         "man_factor","machine_factor","medium_factor","mission_factor","management_factor","remarks"
     ] if c in f.columns]
     disp = f[show_cols].copy()
@@ -361,6 +464,7 @@ with st.expander("Admin: add incident/accident", expanded=False):
                 "aircraft_type": aircraft_type,
                 "category": category,
                 "country": country,
+                "continent": country_to_continent(country),
                 "event_name": event_name,
                 "location": location,
                 "manoeuvre": manoeuvre,
@@ -389,7 +493,7 @@ with st.expander("Admin: add incident/accident", expanded=False):
             new["fatalities"] = new["pilot_killed"] + new["crew_kill"] + new["pax_kill"]
             new["casualties"] = new["fatalities"] + new["pilot_injured"] + new["crew_inj"] + new["pax_inj"]
 
-            # append to working copy (/tmp), save as ISO, then commit to GitHub
+            # append to working copy (/tmp), save as ISO
             try:
                 cur = pd.read_json(WORK_DATA) if WORK_DATA.exists() else pd.DataFrame()
             except Exception:
