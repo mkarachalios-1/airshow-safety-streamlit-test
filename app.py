@@ -174,6 +174,12 @@ def load_data():
     return df, hist
 
 df, hist = load_data()
+# --- force consistent date/year for all records ---
+import pandas as pd  # (already imported at top, but harmless if repeated)
+
+df["date"] = pd.to_datetime(df["date"], errors="coerce")
+df["year"] = df["date"].dt.year
+
 if "df_override" in st.session_state:
     df = st.session_state["df_override"]
 
@@ -194,13 +200,27 @@ with cols_reload[0]:
 
 q = st.text_input("Search", placeholder="e.g. engine, loop, MAC, Duxford")
 
-if df["year"].dropna().empty:
+# ---- YEAR RANGE (robust; keeps rows with missing/bad year) ----
+year_series = pd.to_numeric(df.get("year"), errors="coerce")
+
+if year_series.dropna().empty:
     ymin, ymax = 1908, 2025
 else:
-    ymin, ymax = int(df["year"].min()), int(df["year"].max())
+    ymin = int(year_series.min())
+    ymax = int(year_series.max())
+
 c_year1, c_year2 = st.columns(2)
 year_from = c_year1.number_input("Year from", value=ymin, min_value=ymin, max_value=ymax, step=1)
 year_to   = c_year2.number_input("to",        value=ymax, min_value=ymin, max_value=ymax, step=1)
+
+if not df.empty:
+    # rows with a valid numeric year inside the range
+    mask_in_range = (year_series >= year_from) & (year_series <= year_to)
+    # keep rows with missing year as well, instead of dropping them
+    f = df[mask_in_range | year_series.isna()].copy()
+else:
+    f = df.copy()
+
 
 col_a, col_b, col_c = st.columns(3)
 aircraft_options = sorted([x for x in df.get("aircraft_type","").dropna().unique() if str(x).strip()])
