@@ -216,11 +216,16 @@ m_mgmt = c7.checkbox("Management", True)
 
 # --------- Apply filters ----------
 
+# --------- Apply filters ----------
 if not df.empty:
-    year_series = pd.to_numeric(df["year"], errors="coerce")
-    mask_year = (year_series >= year_from) & (year_series <= year_to)
-    # keep rows with missing year instead of silently dropping them
-    f = df[mask_year | year_series.isna()].copy()
+    # Make sure year is numeric; NaNs indicate missing or unparseable years
+    year_series = pd.to_numeric(df.get("year"), errors="coerce")
+
+    # Inside the selected range
+    in_range = (year_series >= year_from) & (year_series <= year_to)
+
+    # KEEP rows with missing year instead of silently dropping them
+    f = df[in_range | year_series.isna()].copy()
 else:
     f = df.copy()
 
