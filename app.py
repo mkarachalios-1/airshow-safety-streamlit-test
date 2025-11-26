@@ -264,14 +264,23 @@ if not f.empty:
         f = f[f["casualties"] == 0]
 
 # 5M mask
-if not f.empty and any([m_man, m_mach, m_med, m_mis, m_mgmt]):
-    m = pd.Series(False, index=f.index)
-    if m_man:  m |= (f["man_factor"] == 1)
-    if m_mach: m |= (f["machine_factor"] == 1)
-    if m_med:  m |= (f["medium_factor"] == 1)
-    if m_mis:  m |= (f["mission_factor"] == 1)
-    if m_mgmt: m |= (f["management_factor"] == 1)
-    f = f[m]
+if not f.empty:
+    selected_5m = [m_man, m_mach, m_med, m_mis, m_mgmt]
+    n_selected = sum(selected_5m)
+
+    # Only filter if the user has chosen a subset of 5M factors
+    # 0 selected  -> no 5M filtering
+    # 5 selected  -> no 5M filtering (show all, including 0-factor events)
+    if 0 < n_selected < 5:
+        mask_5m = pd.Series(False, index=f.index)
+        if m_man:  mask_5m |= (f["man_factor"] == 1)
+        if m_mach: mask_5m |= (f["machine_factor"] == 1)
+        if m_med:  mask_5m |= (f["medium_factor"] == 1)
+        if m_mis:  mask_5m |= (f["mission_factor"] == 1)
+        if m_mgmt: mask_5m |= (f["management_factor"] == 1)
+        f = f[mask_5m]
+    # else: all or none selected → leave f unchanged
+
 
 # Text search
 if not f.empty and q:
