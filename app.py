@@ -127,53 +127,41 @@ def commit_work_data_to_github():
 # --------- data loading (cached) ----------
 @st.cache_data
 def load_data():
-    if WORK_DATA.exists():
-        src = WORK_DATA
-    elif PKG_DATA.exists():
-        src = PKG_DATA
+    """Single source of truth: read JSON from data/ and enforce clean date/year."""
+    from pathlib import Path
+
+    # 1) Read JSON from the repo (no /tmp, no Excel here)
+    src = Path("data/airshow_accidents.json")
+    df = pd.read_json(src)
+
+    # 2) Force date → datetime and recompute year for ALL rows
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["year"] = df["date"].dt.year
+
+    # 3) Make sure fatalities/casualties are numeric (so filters don’t break)
+    for c in [
+        "fatalities","casualties",
+        "pilot_killed","pilot_injured",
+        "crew_kill","crew_inj",
+        "pax_kill","pax_inj",
+    ]:
+        if c not in df.columns:
+            df[c] = 0
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+
+    # 4) Load historical rates if present
+    hist_path = Path("data/historical_rates.json")
+    if hist_path.exists():
+        import json as _json
+        hist = _json.loads(hist_path.read_text(encoding="utf-8"))
     else:
-        src = None
+        hist = {"years": [], "BAAR": [], "AFR": [], "ACR": [], "AER": []}
 
-    if src is None:
-        df = pd.DataFrame()
-    else:
-        df = pd.read_json(src)
-
-    if df.empty:
-        df = pd.DataFrame(columns=[
-            "date","year","aircraft_type","category","country","manoeuvre",
-            "event_name","location","remarks","contributing_factor",
-            "fatalities","casualties","fit","mac","loc","mechanical","enviro",
-            "pilot_killed","pilot_injured","crew_kill","crew_inj","pax_kill","pax_inj",
-            "man_factor","machine_factor","medium_factor","mission_factor","management_factor"
-        ])
-    else:
-        df["date"] = parse_date_column(df.get("date"), df.get("year"))
-        if "year" not in df.columns:
-            df["year"] = df["date"].dt.year
-        for c in ["fatalities","casualties","pilot_killed","pilot_injured","crew_kill","crew_inj","pax_kill","pax_inj",
-                  "fit","mac","loc","mechanical","enviro",
-                  "man_factor","machine_factor","medium_factor","mission_factor","management_factor"]:
-            if c not in df.columns:
-                df[c] = 0
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
-
-    df["continent"] = df.get("country","").astype(str).apply(country_to_continent)
-
-    if not WORK_DATA.exists() and not df.empty:
-        tmp = df.copy()
-        tmp["date"] = pd.to_datetime(tmp["date"], errors="coerce").dt.strftime("%Y-%m-%d")
-        WORK_DATA.write_text(tmp.to_json(orient="records"), encoding="utf-8")
-
-    hist = {"years": [], "BAAR": [], "AFR": [], "ACR": [], "AER": []}
-    if RATES_JSON.exists():
-        try:
-            hist = json.loads(RATES_JSON.read_text())
-        except Exception:
-            pass
     return df, hist
 
 df, hist = load_data()
+st.caption(f"DEBUG – records loaded from JSON: {len(df)}")
+
 # --- force consistent date/year for all records ---
 import pandas as pd  # (already imported at top, but harmless if repeated)
 
@@ -203,8 +191,11 @@ q = st.text_input("Search", placeholder="e.g. engine, loop, MAC, Duxford")
 # ---- YEAR RANGE (robust; keeps rows with missing/bad year) ----
 year_series = pd.to_numeric(df.get("year"), errors="coerce")
 
+# ---- YEAR RANGE (robust; includes rows even if year is missing) ----
+year_series = pd.to_numeric(df.get("year"), errors="coerce")
+
 if year_series.dropna().empty:
-    ymin, ymax = 1908, 2025
+    ymin, ymax = 1908, 2100  # wide default
 else:
     ymin = int(year_series.min())
     ymax = int(year_series.max())
@@ -212,6 +203,14 @@ else:
 c_year1, c_year2 = st.columns(2)
 year_from = c_year1.number_input("Year from", value=ymin, min_value=ymin, max_value=ymax, step=1)
 year_to   = c_year2.number_input("to",        value=ymax, min_value=ymin, max_value=ymax, step=1)
+
+if not df.empty:
+    in_range = (year_series >= year_from) & (year_series <= year_to)
+    # KEEP rows with missing year instead of silently dropping them
+    f = df[in_range | year_series.isna()].copy()
+else:
+    f = df.copy()
+
 
 if not df.empty:
     # rows with a valid numeric year inside the range
