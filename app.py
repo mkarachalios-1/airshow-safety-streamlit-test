@@ -65,8 +65,8 @@ def country_to_continent(country: str) -> str:
     key = country.strip().lower()
     return _CONTINENT_MAP.get(key, "Unknown")
 
-def col(df: pd.DataFrame, name: str) -> pd.Series:
-    """Safe numeric column accessor (returns zeros if column missing)."""
+def numcol(df: pd.DataFrame, name: str) -> pd.Series:
+    """Safe numeric accessor for optional columns."""
     if name in df.columns:
         return pd.to_numeric(df[name], errors="coerce").fillna(0)
     return pd.Series(0, index=df.index, dtype="float64")
@@ -81,43 +81,55 @@ def load_data():
     else:
         df = pd.DataFrame()
 
-    if not df.empty:
-        # 1) Parse dates as far as possible
-        df["date"] = pd.to_datetime(df.get("date"), errors="coerce")
+    if df.empty:
+        hist = {"years": [], "BAAR": [], "AFR": [], "ACR": [], "AER": []}
+        if RATES_PATH.exists():
+            try:
+                hist = json.loads(RATES_PATH.read_text())
+            except Exception:
+                pass
+        return df, hist
 
-        # 2) Use existing year column if present, otherwise empty
-        if "year" in df.columns:
-            year_raw = pd.to_numeric(df["year"], errors="coerce")
-        else:
-            year_raw = pd.Series(np.nan, index=df.index)
+    # Parse dates
+    df["date_parsed"] = pd.to_datetime(df.get("date"), errors="coerce")
 
-        # 3) Where date is missing but year exists, synthesize a date at Jan-01 of that year
-        mask_fill_date = df["date"].isna() & year_raw.notna()
-        if mask_fill_date.any():
-            df.loc[mask_fill_date, "date"] = pd.to_datetime(
-                year_raw[mask_fill_date].astype(int).astype(str) + "-01-01",
-                errors="coerce"
-            )
+    # derive year robustly
+    year_raw = pd.to_numeric(df.get("year"), errors="coerce")
+    year_from_date = df["date_parsed"].dt.year
+    df["year"] = year_raw.fillna(year_from_date)
 
-        # 4) Always recompute year from date so blank/incorrect year cells do NOT drop records
-        df["year"] = df["date"].dt.year
+    # ensure casualties
+    for c in ["pilot_killed", "pilot_injured", "crew_kill", "crew_inj", "pax_kill", "pax_inj"]:
+        if c not in df.columns:
+            df[c] = 0
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
 
-        # 5) Ensure numeric columns exist and are clean
-        numeric_cols = [
-            "fatalities", "casualties",
-            "pilot_killed", "pilot_injured",
-            "crew_kill", "crew_inj",
-            "pax_kill", "pax_inj",
-            "fit", "mac", "loc", "mechanical", "enviro",
-            "man_factor", "machine_factor", "medium_factor", "mission_factor", "management_factor",
-        ]
-        for c in numeric_cols:
-            if c not in df.columns:
-                df[c] = 0
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+    if "fatalities" not in df.columns:
+        df["fatalities"] = (df["pilot_killed"] + df["crew_kill"] + df["pax_kill"]).astype(int)
+    else:
+        df["fatalities"] = pd.to_numeric(df["fatalities"], errors="coerce").fillna(
+            df["pilot_killed"] + df["crew_kill"] + df["pax_kill"]
+        ).astype(int)
 
-        # 6) Continent
-        df["continent"] = df.get("country", "").astype(str).apply(country_to_continent)
+    if "casualties" not in df.columns:
+        df["casualties"] = (df["fatalities"] + df["pilot_injured"] + df["crew_inj"] + df["pax_inj"]).astype(int)
+    else:
+        df["casualties"] = pd.to_numeric(df["casualties"], errors="coerce").fillna(
+            df["fatalities"] + df["pilot_injured"] + df["crew_inj"] + df["pax_inj"]
+        ).astype(int)
+
+    # 5M flags
+    for c in [
+        "fit", "mac", "loc", "mechanical", "enviro",
+        "man_factor", "machine_factor", "medium_factor", "mission_factor", "management_factor"
+    ]:
+        if c not in df.columns:
+            df[c] = 0
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+
+    # continent
+    df["country"]   = df.get("country", "").astype(str).str.strip()
+    df["continent"] = df["country"].apply(country_to_continent)
 
     # Historical rates
     hist = {"years": [], "BAAR": [], "AFR": [], "ACR": [], "AER": []}
@@ -139,11 +151,14 @@ st.markdown(
 )
 st.markdown("### Barker Airshow Incident & Accident Database")
 
+# Basic debug: how many records loaded
+st.caption(f"Records loaded from JSON: {len(df)}")
+
 # --------- Text search ----------
 q = st.text_input("Search", placeholder="e.g. engine, loop, MAC, Duxford")
 
 # --------- Year range ----------
-if not df.empty and "year" in df.columns and df["year"].dropna().size > 0:
+if not df.empty and df["year"].dropna().size > 0:
     ymin, ymax = int(df["year"].min()), int(df["year"].max())
 else:
     ymin, ymax = 1908, 2025
@@ -155,26 +170,24 @@ year_to   = c_year2.number_input("to",        value=ymax, min_value=ymin, max_va
 # --------- Dropdown filters ----------
 col_a, col_b, col_c = st.columns(3)
 
-aircraft_options = []
-if "aircraft_type" in df.columns:
-    aircraft_options = sorted([x for x in df["aircraft_type"].dropna().unique() if str(x).strip()])
-
-country_options = []
-if "country" in df.columns:
-    country_options = sorted([x for x in df["country"].dropna().unique() if str(x).strip()])
-
-continent_options = []
-if "continent" in df.columns:
-    continent_options = sorted([x for x in df["continent"].dropna().unique() if str(x).strip()])
+aircraft_options = sorted(
+    [x for x in df.get("aircraft_type", pd.Series([], dtype=str)).dropna().unique() if str(x).strip()]
+)
+country_options = sorted(
+    [x for x in df.get("country", pd.Series([], dtype=str)).dropna().unique() if str(x).strip()]
+)
+continent_options = sorted(
+    [x for x in df.get("continent", pd.Series([], dtype=str)).dropna().unique() if str(x).strip()]
+)
 
 sel_aircraft  = col_a.multiselect("Aircraft type", aircraft_options, default=[])
 sel_country   = col_b.multiselect("Country", country_options, default=[])
 sel_continent = col_c.multiselect("Continent", continent_options, default=[])
 
 col_d, col_e = st.columns(2)
-manoeuvre_options = []
-if "manoeuvre" in df.columns:
-    manoeuvre_options = sorted([x for x in df["manoeuvre"].dropna().unique() if str(x).strip()])
+manoeuvre_options = sorted(
+    [x for x in df.get("manoeuvre", pd.Series([], dtype=str)).dropna().unique() if str(x).strip()]
+)
 sel_manoeuvre = col_d.multiselect("Manoeuvre", manoeuvre_options, default=[])
 
 severity = col_e.selectbox(
@@ -189,6 +202,7 @@ severity = col_e.selectbox(
     ],
     index=0,
 )
+severity = str(severity)
 
 # --------- Event type & 5M toggles ----------
 c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
@@ -201,28 +215,30 @@ m_mis  = c6.checkbox("Mission", True)
 m_mgmt = c7.checkbox("Management", True)
 
 # --------- Apply filters ----------
+
 if not df.empty:
-    f = df[(df["year"] >= year_from) & (df["year"] <= year_to)].copy()
+    year_series = pd.to_numeric(df["year"], errors="coerce")
+    mask_year = (year_series >= year_from) & (year_series <= year_to)
+    # keep rows with missing year instead of silently dropping them
+    f = df[mask_year | year_series.isna()].copy()
 else:
     f = df.copy()
 
-# Dropdown filters
-if not f.empty:
-    if sel_aircraft and "aircraft_type" in f.columns:
-        f = f[f["aircraft_type"].isin(sel_aircraft)]
-    if sel_country and "country" in f.columns:
-        f = f[f["country"].isin(sel_country)]
-    if sel_continent and "continent" in f.columns:
-        f = f[f["continent"].isin(sel_continent)]
-    if sel_manoeuvre and "manoeuvre" in f.columns:
-        f = f[f["manoeuvre"].isin(sel_manoeuvre)]
+if not f.empty and sel_aircraft:
+    f = f[f["aircraft_type"].isin(sel_aircraft)]
+if not f.empty and sel_country:
+    f = f[f["country"].isin(sel_country)]
+if not f.empty and sel_continent:
+    f = f[f["continent"].isin(sel_continent)]
+if not f.empty and sel_manoeuvre:
+    f = f[f["manoeuvre"].isin(sel_manoeuvre)]
 
 # Severity filters
-if not f.empty:
-    any_fatal   = (col(f, "fatalities") > 0)
-    pc_fatal    = (col(f, "pilot_killed") + col(f, "crew_kill") > 0)
-    pax_fatal   = (col(f, "pax_kill") > 0)
-    crowd_fatal = (col(f, "spec_kill") + col(f, "pub_kill") > 0)
+if not f.empty and severity != "Any":
+    any_fatal   = (numcol(f, "fatalities") > 0)
+    pc_fatal    = (numcol(f, "pilot_killed") + numcol(f, "crew_kill") > 0)
+    pax_fatal   = (numcol(f, "pax_kill") > 0)
+    crowd_fatal = (numcol(f, "spec_kill") + numcol(f, "pub_kill") > 0)
 
     if severity == "Fatal (any)":
         f = f[any_fatal]
@@ -235,9 +251,8 @@ if not f.empty:
     elif severity == "Fatal: Spectators/Crowd":
         f = f[crowd_fatal]
 
-# Event type: accidents vs incidents
+# Accidents vs incidents
 if not f.empty:
-    # Assume "accident" ≈ any casualties > 0
     if acc_on and not inc_on:
         f = f[f["casualties"] > 0]
     elif inc_on and not acc_on:
@@ -264,7 +279,7 @@ if not f.empty and q:
         f.get("country", "").astype(str) + " " +
         f.get("remarks", "").astype(str) + " " +
         f.get("contributing_factor", "").astype(str) + " " +
-        f["date"].astype(str)
+        f["date_parsed"].astype(str)
     ).str.lower()
     f = f[hay.str.contains(q.lower(), na=False)]
 
@@ -400,9 +415,9 @@ st.divider()
 
 # --------- Table (newest first) ----------
 if not f.empty:
-    f_sorted = f.sort_values("date", ascending=False)
+    f_sorted = f.sort_values("date_parsed", ascending=False)
     show_cols = [c for c in [
-        "date", "aircraft_type", "category",
+        "date_parsed", "aircraft_type", "category",
         "country", "continent",
         "manoeuvre", "fit", "mac", "loc", "mechanical", "enviro",
         "fatalities", "casualties", "pilot_killed", "crew_kill", "pax_kill",
@@ -411,7 +426,8 @@ if not f.empty:
         "remarks",
     ] if c in f_sorted.columns]
     disp = f_sorted[show_cols].copy()
-    disp["date"] = pd.to_datetime(disp["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    disp["date_parsed"] = pd.to_datetime(disp["date_parsed"], errors="coerce").dt.strftime("%Y-%m-%d")
+    disp = disp.rename(columns={"date_parsed": "date"})
 else:
     disp = pd.DataFrame()
 
