@@ -335,7 +335,7 @@ if hist.get("years"):
     years_all = rates["years"]
 
     # AFR / ACR are only valid from 2018 onwards
-    afr_acr_start = 2018
+    afr_acr_start = 2019
     mask_afr_acr = years_all >= afr_acr_start
 
     fig2 = go.Figure()
